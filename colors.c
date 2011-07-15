@@ -1,181 +1,122 @@
-#include <cv.h>
-#include <cvaux.h>
-#include <highgui.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/mman.h>
-#include <math.h>
+#include "common.h"
 
-IplImage* image= 0;
-IplImage*luv= 0,
-	*ycbcr;
+extern context_t g_lastcontext;
 
-#define CHANNELS	3
-#define INFO	"color.info"
-#define MAXFILE	80
-#define OUTSIZE	64
-#define BINCOUNT	32
-typedef struct {
-	unsigned char l,u,v;
-}ee;
-typedef struct {
-	float bins[CHANNELS][BINCOUNT];
-	char	filename[MAXFILE];
-}block;
-
-typedef struct {
-	char filename[MAXFILE];
-	float d;
-}distanceEl;
-
-int bins[CHANNELS][BINCOUNT];
-void gen(int argc, char*argv[]){
-	int iofile = open(INFO, O_WRONLY|O_CREAT|O_APPEND, 0666),
-	    sz,
-	    ix = 0,
+int analyze(char*fname, analSet *calc){
+	int ix = 0,
 	    iy = 0,
-	    total = 0,
-	    tmp = 0;
+	    iz = 0,
+	    ia,
+	    total = 0;
 
+	compSet bins = {{0}};
 	char *pStart;
-	block out;
 	ee *temp;
-	if(iofile == -1) {
-		printf("Can't open %s for writing\n", INFO);
-		exit(0);
+	float tmp, 
+	      max[MAXINDEX] = {0};
+
+//	printf("(ocv) Loading [%s]\n",fname);
+	IplImage *image = cvLoadImage(fname, CV_LOAD_IMAGE_COLOR);
+	IplImage *ycbcr = cvCreateImage(cvGetSize( image ), 8, 3);
+
+//	printf ("(ocv) Colospace [%s]\n", fname);
+	cvCvtColor( image, ycbcr, CV_BGR2YCrCb );
+
+//	printf ("(ocv) Binning\n");
+	for(ix = 0; ix < image->height; ix++) {
+		pStart = ycbcr->imageData + ix * ycbcr->widthStep;
+		for(iy = 0; iy < image->width; iy++) {
+			temp = (ee*)(pStart + (iy * 3));
+			bins[0][temp->l >> 3]++;
+			bins[1][temp->u >> 3]++;
+			bins[2][temp->v >> 3]++;
+
+			total++;
+		}
 	}
-	memset(out.filename, 0, MAXFILE);
-	while(--argc > 0) {
-		memset(out.filename, 0, MAXFILE);
-		memset(bins, 0, CHANNELS * BINCOUNT * sizeof(int));
-		argv++;
-		if((argc % 79) == 0) {
-			printf("\033[9D%d  ", argc);
-			fflush(0);
-		}	
-		image = cvLoadImage(*argv, CV_LOAD_IMAGE_COLOR);
-		if(!image) {
-			continue;
-		}
-		ycbcr = cvCreateImage(cvGetSize( image ), 8, 3);
-		luv = cvCreateImage(cvGetSize( image ), 8, 3);
-		cvCvtColor( image, ycbcr, CV_BGR2YCrCb );
-		cvCvtColor( image, luv, CV_BGR2Luv );
+//	printf ("(ocv) Aggregating\n");
+	for(ix = 0; ix < CHANNELS; ix++) {	
+		for(iy = 0; iy < BINCOUNT; iy++) {
+			tmp = calc->data[ix][iy] = ((float)bins[ix][iy]) / (float)total;
 
-		total = 0;
-		for(ix = 0; ix < image->height; ix++) {
-			pStart = ycbcr->imageData + ix * ycbcr->widthStep;
-			for(iy = 0; iy < image->width; iy++) {
-				temp = (ee*)(pStart + (iy * 3));
-				bins[0][temp->l >> 3]++;
-				bins[1][temp->u >> 3]++;
-				bins[2][temp->v >> 3]++;
-
-				total++;
+			// index work
+			// slot 0 is the highest
+			// MAXINDEX is the lowest
+			for(iz = MAXINDEX - 1; iz >=0; iz--) {
+				if(tmp < max[iz]) {
+					break;
+				}
 			}
-		}
-		for(ix = 0; ix < CHANNELS; ix++) {	
-			for(iy = 0; iy < BINCOUNT; iy++) {
-				out.bins[ix][iy] = ((float)bins[ix][iy]) / (float)total;
+			// to small
+			if(iz == MAXINDEX - 1) {
+				continue;
 			}
+			// this makes things swappable
+			iz++;
+			// push down
+			for(ia = MAXINDEX - 2 ; ia >= iz; ia--) {
+				max[ia + 1] = max[ia];
+				calc->indexes[ia + 1] = calc->indexes[ia];
+			}
+			// now there will be a duplicate at ia (iz)
+			max[iz] = tmp;
+			calc->indexes[iz] = ix * BINCOUNT + iy;
+			/*
+			printf("(ocv) agg: %d %d", iz, ix * BINCOUNT + iy);
+			for(ia = 0; ia < MAXINDEX ; ia++) {
+				printf(" %d:%f ", calc->indexes[ia], max[ia]);
+			}
+			printf("\n");
+			*/
 		}
-
-		sz=strlen(*argv);
-		strncpy((char*)out.filename, *argv, sz);
-		tmp = write(iofile, &out, sizeof(block));	
-		cvReleaseImage(&ycbcr);
-		cvReleaseImage(&image);
 	}
-	close(iofile);
+
+	cvReleaseImage(&ycbcr);
+	cvReleaseImage(&image);
+	return 0;
 }
+
 int compare(const void*el1, const void*el2) {
-	return (int)(((distanceEl*)el2)->d * (500.0 * 1000.0 * 1000.0) - ((distanceEl*)el1)->d * (500.0 * 1000.0 * 1000.0));
+	/*
+	printf("(cmp) %f %f\n", 
+			((distanceEl*)el1)->d ,
+			((distanceEl*)el2)->d );
+
+	*/
+	return (int)(((distanceEl*)el2)->d * (500.0 * 1000.0 * 1000.0) - 
+			((distanceEl*)el1)->d * (500.0 * 1000.0 * 1000.0));
 }
-void match(int argc, char*argv[]){
-	struct stat st;
-	int file,
-	    ix = 0, 
+
+int match(analSet*ref, analTuple*comp, resSet*res, int len){
+	int ix = 0, 
 	    iy,
-	    iz,
-	    count,
-	    tmp;
+	    iz;
 
-	distanceEl *distanceList;
 	float distance;
-	block *pTemp = 0,
-	      *pCompare = 0,
-	      *pOther;
+	analSet *pOtherSet;
 
-	file = open(INFO, O_RDONLY);
-	if(file == 0) {
-		exit(0);
-	}
-	stat(INFO, &st);
-	pTemp = (block*)malloc(st.st_size);
-	tmp = read(file, pTemp, st.st_size);
-	count = st.st_size / sizeof(block);
-	distanceList = (distanceEl*)malloc(count * sizeof(distanceEl));
-	memset(distanceList, 0, sizeof(distanceEl) * count);
-
-	// build up the reference set
-	for(ix = 0; ix < count; ix++) {
-		if(!memcmp(pTemp[ix].filename, argv[0], strlen(argv[0]))) {
-			pCompare = &pTemp[ix];
-			break;
-		}
-	}
-	if(pCompare == 0) {
-		//printf("[]");
-		exit(0);
-	}
-	for(iz = 0; iz < count; iz++) {
+	for(iz = 0; iz < len; iz++) {
 		distance = 0;
 
-		pOther = &pTemp[iz];
+		pOtherSet = &comp[iz].set;
+		//printf("(match) %x\n", comp[iz].set);
 		for(ix = 0; ix < CHANNELS; ix++) {
 			for(iy = 0; iy < BINCOUNT; iy++) {
-				distance += sqrt(pCompare->bins[ix][iy] * pOther->bins[ix][iy]);
+				distance += sqrt(ref->data[ix][iy] * pOtherSet->data[ix][iy]);
 			}
 		}
-		distanceList[iz].d = distance;
-		strcpy(distanceList[iz].filename, pOther->filename);
+		(*res)[iz].d = distance;
+		printf("(match) [%s] %s %f %f\n", g_lastcontext, *(comp[iz].name), (*res)[iz].d, distance);
+		strcpy((*res)[iz].name, *(comp[iz].name));
 	}
-	qsort(distanceList, count, sizeof(distanceEl), compare);
-	if(count > OUTSIZE) {
-		tmp = OUTSIZE;
-	} else {
-		tmp = count;
-	}
-	for(ix = 0; ix < tmp; ix++) {
-		printf("<img src=%s>\n",distanceList[ix].filename);
-	}
+	
+	qsort((*res), len, sizeof(distanceEl), compare);
 
-	/*
-	tmp = count / 4 - (OUTSIZE / 2);
-	for(ix = tmp; ix < tmp + OUTSIZE; ix++) {
-		printf("%s ",distanceList[ix].filename);
-	}
-	tmp = count / 2 - (OUTSIZE / 2);
-	for(ix = tmp; ix < tmp + OUTSIZE; ix++) {
-		printf("%s ",distanceList[ix].filename);
-	}
-	*/
-
-	free(pTemp);
+	return 1;
 }
+
 int main( int argc, char** argv ){
-	argv++;
-	argc--;
-	if((*argv && !strcmp(*argv, "-gen")) || argc < 1) {
-		umask(0);
-		gen(argc, argv);
-		printf("\033[9D");
-	} else {
-		match(argc, argv);
-	}
+	db_connect();
+	start_server(argc, argv);
 	return 0;
 }
